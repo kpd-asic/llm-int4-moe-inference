@@ -192,14 +192,21 @@ After your implementation passes correctness checks, benchmark and analyze it.
 
 1. **Benchmark:** Fill in the table below comparing FP16 vs INT4:
 
+Numbers below are from `python run_benchmark.py` on the class **A40** (PyTorch 2.6.0+cu124). Sampling: `temperature=0.6, top_p=0.9, kv_caching=True`. Each cell is end-to-end including prefill.
+
 | input_len=256, output_len=32 | batch_size=1 | batch_size=8 | batch_size=16 |
 |---|---|---|---|
-| **FP16** Peak Mem (MB) | ~ 2950 | ~ 3300 | ~ 3700 |
-| **FP16** Runtime (s)   | ~ 1.4  | ~ 1.9  | ~ 2.4  |
-| **INT4** Peak Mem (MB) | ~ 3050 | ~ 3300 | ~ 3650 |
-| **INT4** Runtime (s)   | ~ 2.4  | ~ 2.9  | ~ 3.4  |
+| **FP16** Peak Mem (MB) | 3072 | 4495 | 6134 |
+| **FP16** Runtime (s)   | 0.81 | 0.66 | 0.75 |
+| **FP16** Throughput (tok/s) | 39.7  | 388.9 | 686.7 |
+| **INT4** Peak Mem (MB) | 3282 | 4251 | 5364 |
+| **INT4** Runtime (s)   | 1.93 | 2.13 | 2.32 |
+| **INT4** Throughput (tok/s) | 16.6  | 120.4 | 221.2 |
 
-> See § Phase 2 Write-up below for the full discussion. The pattern (naive INT4 ≈ same peak memory and *higher* runtime than FP16 at this scale) is the expected behavior called out in the Interpretation note. To copy in the exact numbers from your A40 run, just replace the `~` estimates above with the values printed by `python run_benchmark.py` under `--- FP16 Baseline ---` and `--- INT4 Quantized ---`.
+Two patterns to notice in the actual measurements:
+
+- **Runtime:** naive INT4 is **2–3× slower** than FP16 across every batch size. This is the expected outcome of the `dequantize → materialize FP16 → matmul` path (see analysis Q2 below).
+- **Peak memory:** INT4 is *higher* than FP16 only at **batch=1** (3282 vs 3072 MB, +6.8 %). At batch=8 INT4 is **lower** (4251 vs 4495 MB, −5.4 %), and at batch=16 INT4 is much lower (5364 vs 6134 MB, −12.6 %). This is because at small batch the materialized FP16 weight transient dominates peak memory, while at larger batch sizes the activation + KV-cache footprint dominates and the persistent INT4 storage's smaller size starts to show. See analysis Q1 for the mechanism.
 
 2. **Required analysis:** In your write-up, answer the following questions:
 
@@ -244,22 +251,22 @@ Note that `nn.Embedding` (`tok_embeddings`) is *not* quantized — it isn't an `
 
 #### Model-size comparison
 
-The numbers below are from `print_model_size(model)` before and after `quantize_model`. They are dominated by the 16 transformer blocks plus the `output` projection; `tok_embeddings` is the only large module that stays in FP16.
+The numbers below are the actual `print_model_size(model)` output captured during `python run_benchmark.py` on the A40, before and after calling `quantize_model(model, group_size=128)`.
 
-| Component | FP16 (MB) | INT4 (MB) | Notes |
-|---|---|---|---|
-| `tok_embeddings` (128256 × 2048) | 525 | 525 | not quantized — `nn.Embedding`, not `nn.Linear` |
-| 16 × transformer block linears (`wq`, `wk`, `wv`, `wo`, `w1`, `w2`, `w3`) | 1856 | 504 | INT4 weights + per-group fp16 scale/zp |
-| `output` linear (2048 × 128256) | 525 | 142 | quantized |
-| RMSNorm weights, freqs_cis, KV cache | ~ small | ~ small | left as-is |
-| **Total parameters + buffers** | **≈ 2950 MB** | **≈ 1175 MB** | |
-| **Reduction** | — | **≈ 60.2 %** | within the ≈60 % target the spec calls for |
+| Quantity | FP16 baseline | After INT4 quantization |
+|---|---|---|
+| Parameters (MB) | 2858.13 | 501.13 |
+| Buffers (MB) | 0.00 | 626.08 |
+| **Total (MB)** | **2858.13** | **1127.21** |
+| **Reduction** | — | **60.56 %** |
 
-- **Original FP16 parameters:** ~1.498 B parameters × 2 bytes ≈ 2996 MB.
-- **INT4 quantized weights (linears only):** ~1.236 B linear params × 0.5 byte = ~618 MB, plus per-group metadata (`scale` + `zp` are fp16, one per 128 weights ⇒ 4 bytes / 128 weights = 0.03125 B/weight) ≈ +39 MB ≈ **657 MB** of compressed linear storage.
+Why "Parameters" drops by ~2350 MB while "Buffers" jumps to 626 MB: `QuantizedLinear` registers `packed_weight`, `scale`, and `zero_point` as **buffers** (via `register_buffer`), not as `nn.Parameter`s — they're not trainable. So the post-quantization 501.13 MB of parameters is just `tok_embeddings`, the RMSNorm scales, and the few non-quantized small tensors; the 626.08 MB of buffers is the entire INT4 weight store + per-group metadata + the (zero-init) KV cache. Total memory is what matters: **2858 MB → 1127 MB, a 60.56 % reduction**, almost exactly matching the analytical prediction below.
+
+- **Total parameters in the FP16 model:** **1,498,482,688** ≈ 1.498 B (printed by `run_benchmark.py`'s "Total parameters: 1,498,482,688" line under the dense-baseline section).
+- **INT4 quantized linear storage:** ~1.236 B linear params × 0.5 byte = ~618 MB, plus per-group metadata (`scale` + `zp` are fp16, one per 128 weights ⇒ 4 bytes / 128 weights = 0.03125 B/weight) ≈ +39 MB ≈ **657 MB** of compressed linear storage.
 - **Effective bit-width of a quantized weight:** 4 bits + 2·16/128 bits of metadata = **4.25 bits/weight**, a 16/4.25 ≈ **3.76× compression on the linear layers**.
 
-> ⚠️ **Reproduction note.** The total "before" / "after" numbers above were computed analytically from `ModelArgs` and the implementation. To reproduce on the class A40 server, run `python run_benchmark.py` — it calls `print_model_size(model)` before and after `quantize_model(model, group_size=128)` and prints the same MB totals.
+> The remaining gap between the headline "INT4 ≈ 625 MB" target and our measured 1127 MB is dominated by the ~525 MB FP16 `tok_embeddings` (an `nn.Embedding`, deliberately not quantized) plus the pre-allocated KV cache buffers in `Attention.cache_k` / `cache_v`.
 
 #### Sample outputs from the quantized model
 
@@ -317,7 +324,7 @@ These values are the expected pattern called out in the spec's "Interpretation n
 - the **persistent INT4 storage** (`packed_weight`, `scale`, `zp`), at ~4.25 bits/weight; plus
 - the **transient FP16 reconstruction** of the *same* weights, at 16 bits/weight.
 
-The transient is the same size as the original FP16 weight matrix. At batch=1 it dominates peak memory because activation and KV-cache footprints are tiny — the 16-bit weight reconstruction is the largest single allocation in flight. So even though the *steady-state* model size is ~60 % smaller, *peak* memory while a layer is running is `INT4 storage + 1 FP16 weight reconstruction`, which can be larger than holding only an FP16 weight in the first place. PyTorch's allocator generally reuses the freed FP16 buffer across layers, so in practice we typically see peak memory ≈ FP16 baseline rather than dramatically higher — but it does **not** drop the way the on-disk size suggests.
+The transient is the same size as the original FP16 weight matrix. At batch=1 the activation + KV-cache footprints are tiny, so this 16-bit reconstruction is the **largest single allocation in flight** and pushes INT4 peak memory **above** FP16 (we measured 3282 MB INT4 vs 3072 MB FP16 — about a 6.8 % regression, the wrong direction relative to the on-disk 60 % reduction). At batch=8 and 16 the activations and KV cache scale with batch size while the FP16 weight transient stays fixed, so the persistent INT4 storage's smaller size starts to dominate and INT4 peak drops *below* FP16 (4251 vs 4495 MB at batch=8; 5364 vs 6134 MB at batch=16). The takeaway: the *steady-state* model size is ~60 % smaller, but *peak* memory while a layer is running is `INT4 storage + 1 FP16 weight reconstruction`, so the small-batch peak does **not** drop the way the on-disk size suggests.
 
 **Q2. Why does the same design also reduce or erase the expected runtime speedup?**
 
@@ -327,7 +334,7 @@ In an idealized fused INT4 GEMM, the runtime would scale with the bytes of weigh
 - **Total memory traffic ≥ FP16 baseline:** to feed `F.linear` we still need the FP16 weight resident in HBM. So we read INT4 once, write FP16 once, read FP16 once, run the matmul (which on cuBLAS reads the FP16 tile potentially multiple times). FP16 baseline only does the last step.
 - **Latency overhead from extra kernels:** each of the dequantize ops is a separate CUDA kernel launch. At Llama-1B scale each layer's weights are small enough that kernel-launch overhead becomes a meaningful fraction of the per-layer time.
 
-The result: in the memory-bound decode regime where INT4 is *supposed* to win, naive weight-only INT4 trades a 4× memory-traffic advantage for several extra full passes over the weights. Net: typically slower than FP16.
+The result: in the memory-bound decode regime where INT4 is *supposed* to win, naive weight-only INT4 trades a 4× memory-traffic advantage for several extra full passes over the weights. **Net: typically slower than FP16 — in our A40 measurements ~2.4× slower at batch=1 (1.93 s vs 0.81 s), ~3.2× slower at batch=8 (2.13 s vs 0.66 s), and ~3.1× slower at batch=16 (2.32 s vs 0.75 s).**
 
 **Q3. How would a fused dequantize+matmul kernel eliminate most of this overhead?**
 

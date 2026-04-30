@@ -1,0 +1,71 @@
+/home1/kpd/.local/lib/python3.12/site-packages/torch/__init__.py:1236: UserWarning: torch.set_default_tensor_type() is deprecated as of PyTorch 2.1, please use torch.set_default_dtype() and torch.set_default_device() as alternatives. (Triggered internally at /pytorch/torch/csrc/tensor/python_tensor.cpp:434.)
+  _C._set_default_tensor_type(t)
+GPU: NVIDIA A40
+PyTorch: 2.6.0+cu124
+
+======================================================================
+PHASE 2: INT4 Quantization Benchmark
+======================================================================
+
+--- FP16 Baseline ---
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+  [FP16] batch=1 in=256 out=32: 0.81s, 3072 MB peak, 39.7 tok/s
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+  [FP16] batch=8 in=256 out=32: 0.66s, 4495 MB peak, 388.9 tok/s
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+  [FP16] batch=16 in=256 out=32: 0.75s, 6134 MB peak, 686.7 tok/s
+
+--- INT4 Quantized ---
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+Model size: 2858.13 MB
+  Parameters: 2858.13 MB
+  Buffers: 0.00 MB
+Model size: 1127.21 MB
+  Parameters: 501.13 MB
+  Buffers: 626.08 MB
+  [INT4] batch=1 in=256 out=32: 1.93s, 3282 MB peak, 16.6 tok/s
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+Model size: 2858.13 MB
+  Parameters: 2858.13 MB
+  Buffers: 0.00 MB
+Model size: 1127.21 MB
+  Parameters: 501.13 MB
+  Buffers: 626.08 MB
+  [INT4] batch=8 in=256 out=32: 2.13s, 4251 MB peak, 120.4 tok/s
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+Model size: 2858.13 MB
+  Parameters: 2858.13 MB
+  Buffers: 0.00 MB
+Model size: 1127.21 MB
+  Parameters: 501.13 MB
+  Buffers: 626.08 MB
+  [INT4] batch=16 in=256 out=32: 2.32s, 5364 MB peak, 221.2 tok/s
+
+======================================================================
+PHASE 3: MoE Benchmark
+======================================================================
+
+--- Dense Baseline ---
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+  Total parameters: 1,498,482,688
+  [Dense] batch=1 in=256 out=32: 0.53s, 3074 MB peak, 60.6 tok/s
+
+--- MoE (N=4, K=2, init=slice) ---
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+Traceback (most recent call last):
+  File "/home1/kpd/ee508/run_benchmark.py", line 154, in <module>
+    benchmark_phase3()
+  File "/home1/kpd/ee508/run_benchmark.py", line 119, in benchmark_phase3
+    model, trainable_params = convert_to_moe(
+                              ^^^^^^^^^^^^^^^
+  File "/home1/kpd/ee508/llama/moe.py", line 258, in convert_to_moe
+    raise NotImplementedError("Complete slice MoE conversion")
+NotImplementedError: Complete slice MoE conversion

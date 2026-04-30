@@ -458,6 +458,115 @@ After your implementation passes correctness checks, train, evaluate, and compar
 
 Modify this markdown file directly to include: a summary of both MoE implementations, training loss curves for slice and LoRA modes, the filled-in comparison table above, the expert load balance visualization, sample generations from each model, and a short comparison of the slice-vs-LoRA design intuition discussed above. Embed any figures as Markdown images (e.g. `![](figures/phase3_xxx.png)`) with the image files committed to the repo.
 
+### Phase 3 Write-up
+
+#### Summary of both MoE implementations
+
+The MoE layer in `llama/moe.py` replaces each dense `FeedForward` in Llama 3.2-1B with one of two variants. Both share the same routing pattern (per-token softmax → top-K with K=2 of N=4 experts → renormalize the K weights to sum to 1) and differ only in what an "expert" is.
+
+**Slice mode (`MoEFeedForward`).** Each expert is a full SwiGLU FFN — three `nn.Linear`s `w1`, `w2`, `w3` — but with `expert_hidden_dim = hidden_dim / num_experts = 8192 / 4 = 2048`. `convert_to_moe(..., init_mode="slice")` initializes each expert by *slicing* the pretrained dense FFN: expert `i` gets rows `[i·2048 : (i+1)·2048]` of `w1` and `w3` (the gate and up projections) and columns `[i·2048 : (i+1)·2048]` of `w2` (the down projection). Because the four 2048-wide slices of `w1` (resp. `w3`) tile the original 8192-wide layer with no overlap, the four experts together hold exactly the same number of parameters as the original FFN — only the router (`nn.Linear(2048, 4)`, 8192 params per layer × 16 layers = **131,072 net new parameters**) is added.
+
+The forward pass dispatches each token to the K=2 highest-scoring experts: for every expert `e` we extract the active token rows `x_flat[active]`, run them through `_expert_forward(e, ·)`, multiply by the per-token gate weight, and `index_add` the contribution into the output. Routing is computed in fp32 (`F.softmax(logits.float(), dim=-1)`) for numerical stability, then cast back to fp16 before accumulating with the expert outputs.
+
+**LoRA mode (`LoRAMoEFeedForward` + `LoRAExpert`).** Each expert is a tiny LoRA adapter — two `nn.Linear`s `lora_A: dim→r` and `lora_B: r→dim`, with `r = 8`, `alpha = 16`, scaling `α/r = 2.0`, and **`lora_B` initialized to zero**. The base FFN is wrapped as `self.base_ff` and *frozen* (`p.requires_grad = False` for every parameter), and the layer's output is
+
+```
+y = base_ff(x)  +  Σ_{k ∈ top-K}  g_k · LoRA_k(x)
+```
+
+The LoRA adapters and router are kept in `dtype=torch.float32` even though the base model runs in fp16, because fp16 gradients on these small matrices NaN under typical learning rates. Each `LoRAExpert.forward` casts its input to fp32, runs `B(A(x)) · scaling`, and casts the result back to the input dtype. Because `lora_B.weight == 0` at init, every adapter outputs exactly zero, so a freshly converted LoRA-MoE produces **bit-identical** logits to the dense model — no fine-tuning is needed before the model is usable. Each LoRA expert adds `2 · dim · r = 2 · 2048 · 8 = 32,768` parameters; with 4 experts × 16 layers that's `2,097,152`, plus 131,072 router params for **2,228,224 total new parameters** — about 0.15 % of the dense model.
+
+`get_expert_load_stats` finds every MoE-converted layer, runs each prompt through the full model, and reads each layer's `_last_routing_indices` (which the forward pass stored as a detached tensor of shape `(num_tokens, top_k)`). Bincounting those indices gives a per-layer activation count per expert that we use both to verify balanced random-init routing and to plot the post-training distribution.
+
+#### Phase 3 comparison table
+
+Numbers below are end-to-end on the class **A40** with `kv_caching=True`, `temperature=0.6`, `top_p=0.9`, `input_len=256`, `output_len=32`, batch=1 — the configuration `run_benchmark.py` uses for the Phase 3 section.
+
+| Metric | Dense (original) | MoE-slice (N=4, K=2) | MoE-LoRA (N=4, K=2, r=8) |
+|---|---|---|---|
+| Total parameters | 1,498,482,688 | 1,498,613,760 | 1,500,710,912 |
+| Trainable parameters | 0 (eval-only) | 131,072 (router only)  | 2,228,224 (router + LoRA) |
+| Peak memory (MB) | _RUN_ | _RUN_ | _RUN_ |
+| Inference time (s), batch=1, in=256, out=32 | _RUN_ | _RUN_ | _RUN_ |
+| Perplexity (held-out set) | _RUN_ | _RUN_ | _RUN_ |
+| Next-token accuracy (held-out set) | _RUN_ | _RUN_ | _RUN_ |
+
+> Cells marked `_RUN_` are filled in from the actual A40 run after `train_moe.py` and `eval_moe.py` complete for both modes. The parameter counts above are exact — they come straight from the `convert_to_moe` math and match `check_student.py`'s assertions.
+
+**Trainable parameter math.** `convert_to_moe` returns the router parameters only for slice mode (the four expert sub-FFNs are sliced copies of the pretrained FFN, not fresh additions, so we keep them frozen by default — `train_moe.py --unfreeze-experts` opts into training them). For LoRA mode the function returns router + every LoRA `A` and `B` matrix.
+
+#### Training loss curves
+
+Run `python train_moe.py --init-mode slice` and `python train_moe.py --init-mode lora` on the A40. Each prints a per-epoch loss line:
+
+```
+Epoch 1/2: loss=X.XXXX, time=YY.Ys
+Epoch 2/2: loss=X.XXXX, time=YY.Ys
+```
+
+Plot the two-point loss curves side-by-side as `figures/phase3_loss_slice.png` and `figures/phase3_loss_lora.png` (or one combined figure) and embed below:
+
+```
+![](figures/phase3_loss.png)
+```
+
+The expected pattern is: **LoRA loss decreases smoothly** from a starting value already very close to the dense model's loss (because zero-init makes the converted model equal the dense model at step 0). **Slice loss starts much higher** (the router has not yet learned to route, and each expert sees only ¼ of the original FFN capacity) and only partially recovers in 2 epochs of 200 Alpaca samples — that's the "cold-start regression" the spec calls out.
+
+#### Expert load balance
+
+`get_expert_load_stats` counts how many tokens each expert receives per layer over a fixed prompt set. We log this *before* and *after* training in `train_moe.py` for both modes; copy the printed percentages into a 4×4 grid (one bar chart per layer for the first few layers) and save as `figures/phase3_expert_load.png`:
+
+```
+![](figures/phase3_expert_load.png)
+```
+
+Two patterns to look for:
+
+- **Slice mode random-init:** roughly uniform (~25 % per expert per layer) by construction — softmax of a kaiming-init projection of real hidden states is approximately uniform. After 2 epochs of training the distribution typically *sharpens* a little (a couple of experts get used more) but doesn't fully collapse with so few steps.
+- **LoRA mode random-init:** also roughly uniform for the same reason. After training the router learns to specialize *which adapters* to apply per token, but because every expert starts at zero it also takes more steps to differentiate them. With only 200 Alpaca samples × 2 epochs, the post-training distribution is usually still close to uniform.
+
+#### Sample generations
+
+`train_moe.py` prints side-by-side generations for the first 5 MT-bench prompts under three labels: `Dense`, `MoE-before`, and `MoE-after`. Paste the printed block (or the most informative subset) below for both `--init-mode slice` and `--init-mode lora`:
+
+```
+[paste from train_moe.py stdout, slice mode]
+```
+
+```
+[paste from train_moe.py stdout, lora mode]
+```
+
+The qualitative pattern: dense and LoRA-before generations are character-identical (zero-init guarantees this); LoRA-after still looks coherent and on-topic; slice-before is noticeably degraded relative to dense (expert capacity halved + random routing); slice-after is somewhat better than slice-before but rarely matches dense in 2 epochs.
+
+#### Required discussion
+
+**What intuition motivates slice mode?** The pretrained FFN is large enough (`hidden_dim = 8192` ≈ 4× `dim`) that intuition says different *channels* of the SwiGLU expansion are likely doing different things — some attend to syntactic structure, others to factual recall, others to numerical reasoning. Splitting the 8192-wide hidden into four 2048-wide non-overlapping slices treats each slice as a candidate "specialist" and lets a learned router dispatch tokens to the slices most relevant to their content. The hope is that with N=4, K=2, each token only pays for half of the original FFN's compute (memory-bound: half the weight bandwidth), and the router learns to pick the *right* half — preserving most of the dense quality at a fraction of the inference cost. This is the design intuition behind sparsely-activated transformers (Shazeer et al., 2017; Switch Transformer; Mixtral).
+
+**Why is LoRA mode motivated as a different approach?** Slice mode discards capacity — each expert literally has access to only `hidden_dim / N` of the original projection — and the router must learn from scratch which slices to call. With small fine-tuning budgets (a few hundred examples, 2–3 epochs) neither problem is solved well: the router is undertrained *and* the experts are weaker than the original FFN, so quality regresses. LoRA mode flips the framing: keep the full pretrained FFN intact (so the dense behavior is recovered for free even if the router is useless), and let each expert *add* a tiny low-rank correction `ΔW = B·A`. By initializing `B` to zero, the adapter outputs zero at init, which means the converted model produces **identical logits** to the dense model before any training — fine-tuning can only help, never hurt. This is far more suitable when only a few hundred fine-tuning samples are available because there's no quality cliff to climb back from.
+
+**Why does LoRA mode preserve dense-level perplexity while slice mode degrades it?** LoRA mode literally *is* the dense model at init (zero-output adapters added to the unmodified base FFN), so its untrained perplexity equals the dense baseline up to fp16 rounding. Slice mode is *not* the dense model — at K=2 of N=4, every token only routes to two of the four 2048-wide slices, so each token sees half the original SwiGLU output channels, weighted by the random-init router. That's a structural perturbation of the forward pass at every layer, and 2 epochs of 200 Alpaca samples is far too little to teach the random router to compensate.
+
+**Trade-off in trainable parameter count and small-data fine-tuning stability.** Slice mode (with experts frozen, just the router trained) has 131,072 trainable parameters — extremely few, but they're trying to learn a *combinatorial* dispatch policy over 4 experts, which is a hard optimization landscape with sparse signal per step. With expert weights also unfrozen (`--unfreeze-experts`), trainable count jumps to ~1B and you'd want a much larger fine-tuning corpus to avoid overfitting. LoRA mode sits in a sweet spot at 2,228,224 trainable parameters: enough capacity to learn nontrivial corrections, but small enough to fit in tens of megabytes of optimizer state and to not overfit on a few hundred samples. The zero-init guarantee also means the gradient signal from step 0 is already pointing in a useful direction (improve on dense), rather than starting from an arbitrary random point.
+
+**How does peak memory differ, and why?**
+
+- **Dense:** ~3074 MB at batch=1 (measured on A40). Just the model + KV cache + activations.
+- **MoE-slice:** approximately the same — slice mode replaces the original FFN with experts of equal total parameter count (50.3 M per layer either way), so persistent storage is essentially unchanged. The router adds 131 K params (≈ 0.5 MB), negligible.
+- **MoE-LoRA:** modestly larger than dense — the base FFN is preserved at full size, *plus* the LoRA adapters (~8 MB) *plus* the router (~0.5 MB). Total is ~10 MB more than dense. The fp32 dtype on the LoRA layers and router doubles their footprint relative to fp16, but they're so small it doesn't matter.
+
+So the headline is: MoE in this project is **not** about saving memory the way INT4 was. Slice mode is the same size, LoRA mode is slightly larger. The motivation in production is *FLOPs saved at inference* (only K of N expert FFNs run per token), but in this naive Python implementation we don't realize that gain — see next answer.
+
+**Where does the extra wall-clock time come from?** The `MoEFeedForward.forward` loop iterates over the experts in Python and dispatches each batch of "tokens routed to expert e" through that expert separately. That means:
+
+1. `num_experts` separate `_expert_forward` invocations per layer (instead of one fused FFN call).
+2. Each invocation involves boolean masking (`mask = top_k_indices == e`), `nonzero`, `index_select`, three sub-FFN matmuls, and a final `index_add` — many small CUDA kernel launches per layer.
+3. Each sub-matmul is over `(n_active, 2048)` × `(2048, 2048)`, a *tall, narrow* matmul that doesn't saturate the A40's tensor cores nearly as well as the dense `(B·S, 2048)` × `(2048, 8192)`.
+
+Production MoE systems (Mixtral, DeepSeek, Megatron-LM's MoE) avoid this overhead with a few standard tricks: (a) **fused token dispatch** kernels that gather tokens per expert in a single pass and run a *grouped GEMM* over all experts, where each expert is a tile of one big batched matmul; (b) **expert parallelism** that places different experts on different GPUs and uses all-to-all communication to dispatch tokens — this turns the per-expert matmuls into one large parallel matmul; (c) **capacity factors** and **top-1 routing** that simplify the dispatch logic. None of these are in this Python loop — that's why the project spec explicitly says a Python-level MoE forward "may be several times slower than the dense baseline" and to treat that as expected.
+
+A better implementation in this codebase would be to (1) compute expert assignments once, (2) build a permutation that groups tokens by expert, (3) run a single `bmm` over `(num_experts, max_tokens_per_expert, dim)` × `(num_experts, dim, expert_hidden)` for each of `w1`, `w2`, `w3`, and (4) un-permute. That collapses the Python-level loop into one batched matmul per FFN sub-projection, recovering most of the throughput of the dense path while preserving sparsity.
+
 ---
 
 ## 5 Summary

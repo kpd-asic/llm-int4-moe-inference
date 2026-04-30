@@ -480,64 +480,114 @@ The LoRA adapters and router are kept in `dtype=torch.float32` even though the b
 
 #### Phase 3 comparison table
 
-Numbers below are end-to-end on the class **A40** with `kv_caching=True`, `temperature=0.6`, `top_p=0.9`, `input_len=256`, `output_len=32`, batch=1 — the configuration `run_benchmark.py` uses for the Phase 3 section.
+All numbers below are from the actual A40 run (`run_benchmark.py` for memory/runtime, `eval_moe.py` for perplexity/accuracy/speed). Inference timing is `batch=1, input_len=256, output_len=32, kv_caching=True, temperature=0.6, top_p=0.9`. Perplexity and next-token accuracy are computed over **100 held-out Alpaca samples (#200–#299), 5,711 evaluated tokens** — disjoint from the 200 samples used for fine-tuning.
 
 | Metric | Dense (original) | MoE-slice (N=4, K=2) | MoE-LoRA (N=4, K=2, r=8) |
 |---|---|---|---|
 | Total parameters | 1,498,482,688 | 1,498,613,760 | 1,500,710,912 |
-| Trainable parameters | 0 (eval-only) | 131,072 (router only)  | 2,228,224 (router + LoRA) |
-| Peak memory (MB) | _RUN_ | _RUN_ | _RUN_ |
-| Inference time (s), batch=1, in=256, out=32 | _RUN_ | _RUN_ | _RUN_ |
-| Perplexity (held-out set) | _RUN_ | _RUN_ | _RUN_ |
-| Next-token accuracy (held-out set) | _RUN_ | _RUN_ | _RUN_ |
+| Trainable parameters | — (eval baseline) | 131,072 (router only) | 2,228,224 (router + LoRA) |
+| Peak memory (MB), batch=1 | 3074 | 3075 | 3082 |
+| Inference time (s), batch=1 | 0.42 | 0.82 | 0.90 |
+| Generation speed (tok/s) | 76.7 | 39.0 | 35.6 |
+| Perplexity ↓ (post-training) | 9.66 | 3459.75 | **9.49** |
+| Next-token accuracy ↑ (post-training) | 51.30 % | 4.43 % | **51.69 %** |
+| Perplexity at conversion (pre-training) | — | 344,770.76 | 9.66 |
+| Next-token accuracy at conversion | — | 0.00 % | 51.30 % |
 
-> Cells marked `_RUN_` are filled in from the actual A40 run after `train_moe.py` and `eval_moe.py` complete for both modes. The parameter counts above are exact — they come straight from the `convert_to_moe` math and match `check_student.py`'s assertions.
+**Headline:** LoRA mode actually *beats* the dense baseline on both held-out perplexity (9.49 vs 9.66, **−1.8 % relative**) and next-token accuracy (51.69 % vs 51.30 %, **+0.39 pp**) using only **2.23 M trainable parameters** (0.15 % of the model). Slice mode is **358× worse** in perplexity than dense even after training (3460 vs 9.66) and produces gibberish generations. The contrast confirms the design intuition spelled out in §4.2: zero-init LoRA is bit-identical to dense at step 0 and can only improve from there, while slice mode has to claw its way back from a structural perturbation that destroys the pretrained behavior.
 
 **Trainable parameter math.** `convert_to_moe` returns the router parameters only for slice mode (the four expert sub-FFNs are sliced copies of the pretrained FFN, not fresh additions, so we keep them frozen by default — `train_moe.py --unfreeze-experts` opts into training them). For LoRA mode the function returns router + every LoRA `A` and `B` matrix.
 
 #### Training loss curves
 
-Run `python train_moe.py --init-mode slice` and `python train_moe.py --init-mode lora` on the A40. Each prints a per-epoch loss line:
+Both modes were fine-tuned on the first 200 Alpaca samples for 2 epochs (script defaults: `lr_router=1e-3`, `lr_expert=1e-4`, SGD with momentum=0.9 and grad-norm clipping at 1.0).
 
-```
-Epoch 1/2: loss=X.XXXX, time=YY.Ys
-Epoch 2/2: loss=X.XXXX, time=YY.Ys
-```
+| Mode | Trainable params | Epoch 1 loss | Epoch 2 loss |
+|---|---|---|---|
+| Slice (router only) | 131,072 | 10.886 | 8.411 |
+| LoRA (router + adapters) | 2,228,224 | 2.374 | 2.359 |
 
-Plot the two-point loss curves side-by-side as `figures/phase3_loss_slice.png` and `figures/phase3_loss_lora.png` (or one combined figure) and embed below:
-
-```
 ![](figures/phase3_loss.png)
-```
 
-The expected pattern is: **LoRA loss decreases smoothly** from a starting value already very close to the dense model's loss (because zero-init makes the converted model equal the dense model at step 0). **Slice loss starts much higher** (the router has not yet learned to route, and each expert sees only ¼ of the original FFN capacity) and only partially recovers in 2 epochs of 200 Alpaca samples — that's the "cold-start regression" the spec calls out.
+The numbers tell two completely different stories:
+
+- **LoRA** starts at training loss ≈ 2.37, which is essentially the dense Llama-3.2-1B's loss on this corpus — that's the zero-init guarantee in action. After 200 × 2 = 400 update steps, loss drops by 0.015 (≈ 0.6 %). It's a small absolute decrease, but it lands at *better-than-dense* held-out perplexity (9.49 vs 9.66), so the optimizer is moving in a useful direction.
+- **Slice** starts at training loss ≈ 11.7 — about 5× the dense baseline — because the conversion (random kaiming router + non-overlapping FFN slices) genuinely breaks the pretrained model. Two epochs are enough to drop loss to 8.4 (a 28 % reduction), but that's still far above dense and the held-out perplexity remains catastrophic (3460). The "cold-start regression" the spec warned about is exactly this gap.
 
 #### Expert load balance
 
-`get_expert_load_stats` counts how many tokens each expert receives per layer over a fixed prompt set. We log this *before* and *after* training in `train_moe.py` for both modes; copy the printed percentages into a 4×4 grid (one bar chart per layer for the first few layers) and save as `figures/phase3_expert_load.png`:
+Per-layer expert activation percentages from `get_expert_load_stats` over 10 MT-bench prompts (totals ≈ 72 routings per layer = num_tokens × top_k=2). Captured before and after fine-tuning by `train_moe.py`, the first four layers shown:
 
-```
+**Slice mode (N=4, K=2)**
+
+| Layer | Before training | After training |
+|---|---|---|
+| 0 | 18 / 26 / 21 / 36 % | 17 / 22 / 16 / **45** % |
+| 1 | 15 / 34 / 13 / 38 % | **48** / 26 / 13 / 14 % |
+| 2 | 3 / 43 / 35 / 19 % | 40 / 46 / **6 / 7** % |
+| 3 | 49 / 0 / 30 / 21 % | 19 / **50** / 23 / 7 % |
+
+**LoRA mode (N=4, K=2, r=8)**
+
+| Layer | Before training | After training |
+|---|---|---|
+| 0 | 18 / 26 / 21 / 36 % | 25 / 21 / 34 / 21 % |
+| 1 | 41 / 15 / 27 / 17 % | 30 / 11 / 21 / 38 % |
+| 2 | 27 / 33 / 17 / 24 % | 18 / 33 / 20 / 29 % |
+| 3 | 30 / 22 / 17 / 31 % | 31 / 25 / 33 / 11 % |
+
 ![](figures/phase3_expert_load.png)
-```
 
-Two patterns to look for:
+Two patterns are visible in the data:
 
-- **Slice mode random-init:** roughly uniform (~25 % per expert per layer) by construction — softmax of a kaiming-init projection of real hidden states is approximately uniform. After 2 epochs of training the distribution typically *sharpens* a little (a couple of experts get used more) but doesn't fully collapse with so few steps.
-- **LoRA mode random-init:** also roughly uniform for the same reason. After training the router learns to specialize *which adapters* to apply per token, but because every expert starts at zero it also takes more steps to differentiate them. With only 200 Alpaca samples × 2 epochs, the post-training distribution is usually still close to uniform.
+- **Slice mode shows real load imbalance** *and it gets worse* after training. Look at layer 2 after training: experts 2 and 3 collapse to 6 % and 7 % of routings, while experts 0 and 1 capture 86 % between them. Layer 3 has a single expert at 50 %. This is the classic "winner-take-all" instability of routed MoE without auxiliary load-balancing loss — once the router slightly prefers one expert, the gradient signal reinforces that preference, and the unused experts never receive learning signal. With only 400 training steps and no balance penalty, slice mode is already showing the failure mode.
+- **LoRA mode stays roughly uniform** through training. Every expert is between 11 % and 38 % across all four layers shown. This is partly because LoRA's zero-init means every expert outputs the same value (zero) for many initial steps, so the router has no incentive to specialize hard — gradient signal is dominated by the base FFN. With more data and stronger gradient signal we'd see specialization develop, but at 400 steps the distribution stays balanced.
 
 #### Sample generations
 
-`train_moe.py` prints side-by-side generations for the first 5 MT-bench prompts under three labels: `Dense`, `MoE-before`, and `MoE-after`. Paste the printed block (or the most informative subset) below for both `--init-mode slice` and `--init-mode lora`:
+Side-by-side completions on three representative MT-bench prompts. All three completions per prompt are 100 characters of the model's continuation under `temperature=0.6, top_p=0.9, max_gen_len=64`.
+
+**Slice mode** (`phase3_train_slice.log`, `--init-mode slice`):
 
 ```
-[paste from train_moe.py stdout, slice mode]
+Q: Compose a short poem about the beauty of mathematics.
+  Dense:       The poem must be between 20 and 30 lines long, and must include the words "Beauty of Mathematics" s
+  MoE-before:  Tx neighbours neighbours Create expressesilenamesilenamesilenamesilenamesilenamesilenamesilenamesi
+  MoE-after:   a a a a, and and a a,,,, and and and and a a a a,,, and and and and and and the and and and and and
+
+Q: Draft a professional email declining a job offer politely.
+  Dense:       The email should include the rejection of the job offer and should be sent within a few days of rec
+  MoE-before:  unreasonable reasonablereasonable reasonable reasonable reasonablereasonable reasonable reasonabler
+  MoE-after:   (empty — model emits EOS immediately)
+
+Q: If a train travels at 60 mph for 2.5 hours, how far does it go?
+  Dense:       Answer: 150 miles. If a train travels at 60 mph for 2.5 hours, how far does it go? Show your reason
+  MoE-before:  ologistsologistsologistsilenamespreadpreadpreadpreadpreadpreadpreadpreadpreadpreadpreadpreadpreadpre
+  MoE-after:   ,,, a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a
 ```
 
+Slice MoE pre-training emits high-frequency tokens in long repeats (`silename`, `Consultants`, `presidents`) — the structural perturbation has steered the lm_head into low-entropy garbage. Post-training, the model shifts to even-higher-frequency tokens (commas, "a", "and") because the LM is now optimizing for any token-level next-word agreement and stopwords are easiest to match. **It never recovers task-following ability** — there is zero correlation between the prompt and the completion.
+
+**LoRA mode** (`phase3_train_lora.log`, `--init-mode lora`):
+
 ```
-[paste from train_moe.py stdout, lora mode]
+Q: Compose a short poem about the beauty of mathematics.
+  Dense:       The poem must be between 20 and 30 lines long, and must include the words "Beauty of Mathematics" s
+  MoE-before:  Include at least 3 mathematical symbols in your poem. You can use mathematical symbols from the mat
+  MoE-after:   You can use any topic or theme you wish. If you like, you can include a personal story or anecdote
+
+Q: Draft a professional email declining a job offer politely.
+  Dense:       The email should include the rejection of the job offer and should be sent within a few days of rec
+  MoE-before:  This is a good way to let the company know that you are no longer interested in the job offer. It i
+  MoE-after:   This is a step-by-step guide for writing a professional email declining a job offer. This article w
+
+Q: If a train travels at 60 mph for 2.5 hours, how far does it go?
+  Dense:       Answer: 150 miles. If a train travels at 60 mph for 2.5 hours, how far does it go? Show your reason
+  MoE-before:  A. 15 miles B. 15.25 miles C. 30 miles D. 45 miles. If a train travels at 60 mph for 2.5 hours, how
+  MoE-after:   A) 150 miles B) 125 miles C) 150 miles D) 150 miles E) 150 miles. A train travels 60 miles in 2.5 ho
 ```
 
-The qualitative pattern: dense and LoRA-before generations are character-identical (zero-init guarantees this); LoRA-after still looks coherent and on-topic; slice-before is noticeably degraded relative to dense (expert capacity halved + random routing); slice-after is somewhat better than slice-before but rarely matches dense in 2 epochs.
+LoRA MoE pre-training produces continuations that are *different* from dense (sampling is non-deterministic across runs) but still on-topic and grammatical — the zero-init guarantees logit-equality, but greedy sampling differences across runs still produce different sequences. Post-training, generations remain coherent and the math prompt now correctly contains "150 miles" as the answer (one of the multiple-choice options). This is consistent with the held-out perplexity going *down* after training (9.66 → 9.49).
 
 #### Required discussion
 
@@ -549,23 +599,24 @@ The qualitative pattern: dense and LoRA-before generations are character-identic
 
 **Trade-off in trainable parameter count and small-data fine-tuning stability.** Slice mode (with experts frozen, just the router trained) has 131,072 trainable parameters — extremely few, but they're trying to learn a *combinatorial* dispatch policy over 4 experts, which is a hard optimization landscape with sparse signal per step. With expert weights also unfrozen (`--unfreeze-experts`), trainable count jumps to ~1B and you'd want a much larger fine-tuning corpus to avoid overfitting. LoRA mode sits in a sweet spot at 2,228,224 trainable parameters: enough capacity to learn nontrivial corrections, but small enough to fit in tens of megabytes of optimizer state and to not overfit on a few hundred samples. The zero-init guarantee also means the gradient signal from step 0 is already pointing in a useful direction (improve on dense), rather than starting from an arbitrary random point.
 
-**How does peak memory differ, and why?**
+**How does peak memory differ, and why?** Measured on the A40 at `batch=1, input_len=256, output_len=32`:
 
-- **Dense:** ~3074 MB at batch=1 (measured on A40). Just the model + KV cache + activations.
-- **MoE-slice:** approximately the same — slice mode replaces the original FFN with experts of equal total parameter count (50.3 M per layer either way), so persistent storage is essentially unchanged. The router adds 131 K params (≈ 0.5 MB), negligible.
-- **MoE-LoRA:** modestly larger than dense — the base FFN is preserved at full size, *plus* the LoRA adapters (~8 MB) *plus* the router (~0.5 MB). Total is ~10 MB more than dense. The fp32 dtype on the LoRA layers and router doubles their footprint relative to fp16, but they're so small it doesn't matter.
+- **Dense:** 3074 MB. Model weights + KV cache + activations.
+- **MoE-slice:** 3075 MB (+1 MB). Slice mode swaps the original FFN for experts that hold the *same total parameters* (4 × hidden/4 = hidden), so persistent storage is essentially unchanged. The router adds 131,072 fp16 params ≈ 0.25 MB; the rest of the +1 MB is alignment / allocator slack.
+- **MoE-LoRA:** 3082 MB (+8 MB vs dense). The base FFN is preserved at full fp16 size, *plus* the LoRA adapters (2.10 M fp32 params ≈ 8 MB) *plus* the router (0.13 M fp32 ≈ 0.5 MB). The fp32 dtype on LoRA and router doubles their per-parameter cost vs fp16, but the absolute size is small enough that it doesn't matter.
 
-So the headline is: MoE in this project is **not** about saving memory the way INT4 was. Slice mode is the same size, LoRA mode is slightly larger. The motivation in production is *FLOPs saved at inference* (only K of N expert FFNs run per token), but in this naive Python implementation we don't realize that gain — see next answer.
+The headline: MoE in this project is **not** about saving memory the way INT4 was. Slice mode is essentially the same size as dense, LoRA mode is +8 MB. The motivation in production is *FLOPs saved at inference* (only K of N expert FFNs run per token), but in this naive Python implementation we don't realize that gain — see next answer.
 
-**Where does the extra wall-clock time come from?** The `MoEFeedForward.forward` loop iterates over the experts in Python and dispatches each batch of "tokens routed to expert e" through that expert separately. That means:
+**Where does the extra wall-clock time come from?** Dense runs in 0.42 s; slice runs in 0.82 s (1.95×); LoRA runs in 0.90 s (2.14×). The 2× slowdown is not because MoE does *more* mathematical work per token — it does less, since only K=2 of N=4 experts execute per token. The slowdown is because of how the dispatch is implemented:
 
-1. `num_experts` separate `_expert_forward` invocations per layer (instead of one fused FFN call).
-2. Each invocation involves boolean masking (`mask = top_k_indices == e`), `nonzero`, `index_select`, three sub-FFN matmuls, and a final `index_add` — many small CUDA kernel launches per layer.
-3. Each sub-matmul is over `(n_active, 2048)` × `(2048, 2048)`, a *tall, narrow* matmul that doesn't saturate the A40's tensor cores nearly as well as the dense `(B·S, 2048)` × `(2048, 8192)`.
+1. **N=4 separate `_expert_forward` invocations per layer**, instead of one fused FFN call. With 16 layers × 4 experts = 64 expert invocations per forward pass on top of the dense baseline's 16 FFN calls.
+2. Each invocation involves boolean masking (`mask = top_k_indices == e`), `nonzero`, `index_select`, three sub-FFN matmuls in fp16, and a final `index_add` — **many small CUDA kernel launches per layer.** At 1B-parameter scale each kernel runs for ~tens of microseconds and the launch latency stops being amortizable.
+3. Each sub-matmul is over `(n_active, 2048) × (2048, 2048)`, a *tall, narrow* shape that doesn't saturate the A40's tensor cores nearly as well as the dense `(B·S, 2048) × (2048, 8192)` would.
+4. **LoRA mode adds ~10 % more time** on top of slice (0.90 s vs 0.82 s) because each LoRA expert does *two extra fp32 matmuls* (`A` and `B`) on top of running the base FFN — base + 4 small LoRAs > base alone, and the fp16↔fp32 casts inside `LoRAExpert.forward` are also non-trivial at this scale.
 
-Production MoE systems (Mixtral, DeepSeek, Megatron-LM's MoE) avoid this overhead with a few standard tricks: (a) **fused token dispatch** kernels that gather tokens per expert in a single pass and run a *grouped GEMM* over all experts, where each expert is a tile of one big batched matmul; (b) **expert parallelism** that places different experts on different GPUs and uses all-to-all communication to dispatch tokens — this turns the per-expert matmuls into one large parallel matmul; (c) **capacity factors** and **top-1 routing** that simplify the dispatch logic. None of these are in this Python loop — that's why the project spec explicitly says a Python-level MoE forward "may be several times slower than the dense baseline" and to treat that as expected.
+Production MoE systems (Mixtral, DeepSeek-V3, Megatron-LM's MoE) avoid this overhead with a few standard tricks: (a) **fused token dispatch** kernels that gather tokens per expert in a single pass and run a *grouped GEMM* over all experts, where each expert is a tile of one big batched matmul; (b) **expert parallelism** that places different experts on different GPUs and uses all-to-all communication to dispatch tokens — turning per-expert matmuls into one large parallel matmul; (c) **capacity factors** and **top-1 routing** to simplify the dispatch logic. None of these are in this Python loop — that's why the project spec explicitly notes a Python-level MoE forward "may be several times slower than the dense baseline" and to treat that as expected.
 
-A better implementation in this codebase would be to (1) compute expert assignments once, (2) build a permutation that groups tokens by expert, (3) run a single `bmm` over `(num_experts, max_tokens_per_expert, dim)` × `(num_experts, dim, expert_hidden)` for each of `w1`, `w2`, `w3`, and (4) un-permute. That collapses the Python-level loop into one batched matmul per FFN sub-projection, recovering most of the throughput of the dense path while preserving sparsity.
+A better implementation in this codebase would be to (1) compute expert assignments once, (2) build a permutation that groups tokens by expert, (3) run a single `bmm` over `(num_experts, max_tokens_per_expert, dim) × (num_experts, dim, expert_hidden)` for each of `w1`, `w2`, `w3`, and (4) un-permute. That collapses the Python-level loop into one batched matmul per FFN sub-projection, recovering most of the throughput of the dense path while preserving sparsity. The compute *is* lower — we just need to stop launching N kernels to express it.
 
 ---
 

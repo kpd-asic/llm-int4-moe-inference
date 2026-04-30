@@ -1,0 +1,88 @@
+/home1/kpd/.local/lib/python3.12/site-packages/torch/__init__.py:1236: UserWarning: torch.set_default_tensor_type() is deprecated as of PyTorch 2.1, please use torch.set_default_dtype() and torch.set_default_device() as alternatives. (Triggered internally at /pytorch/torch/csrc/tensor/python_tensor.cpp:434.)
+  _C._set_default_tensor_type(t)
+GPU: NVIDIA A40
+PyTorch: 2.6.0+cu124
+
+======================================================================
+PHASE 2: INT4 Quantization Benchmark
+======================================================================
+
+--- FP16 Baseline ---
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+  [FP16] batch=1 in=256 out=32: 0.65s, 3072 MB peak, 49.1 tok/s
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+  [FP16] batch=8 in=256 out=32: 0.53s, 4495 MB peak, 484.1 tok/s
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+  [FP16] batch=16 in=256 out=32: 0.64s, 6134 MB peak, 805.6 tok/s
+
+--- INT4 Quantized ---
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+Model size: 2858.13 MB
+  Parameters: 2858.13 MB
+  Buffers: 0.00 MB
+Model size: 1127.21 MB
+  Parameters: 501.13 MB
+  Buffers: 626.08 MB
+  [INT4] batch=1 in=256 out=32: 1.93s, 3282 MB peak, 16.6 tok/s
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+Model size: 2858.13 MB
+  Parameters: 2858.13 MB
+  Buffers: 0.00 MB
+Model size: 1127.21 MB
+  Parameters: 501.13 MB
+  Buffers: 626.08 MB
+  [INT4] batch=8 in=256 out=32: 2.12s, 4251 MB peak, 120.7 tok/s
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+Model size: 2858.13 MB
+  Parameters: 2858.13 MB
+  Buffers: 0.00 MB
+Model size: 1127.21 MB
+  Parameters: 501.13 MB
+  Buffers: 626.08 MB
+  [INT4] batch=16 in=256 out=32: 2.31s, 5364 MB peak, 221.3 tok/s
+
+======================================================================
+PHASE 3: MoE Benchmark
+======================================================================
+
+--- Dense Baseline ---
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+  Total parameters: 1,498,482,688
+  [Dense] batch=1 in=256 out=32: 0.42s, 3074 MB peak, 76.7 tok/s
+
+--- MoE (N=4, K=2, init=slice) ---
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+  Total parameters: 1,498,613,760
+  Trainable parameters: 131,072
+  [MoE-slice] batch=1 in=256 out=32: 0.82s, 3075 MB peak, 39.0 tok/s
+
+  Expert load distribution:
+    Layer 0: ['31%', '33%', '14%', '22%'] (total=72)
+    Layer 1: ['17%', '35%', '21%', '28%'] (total=72)
+    Layer 2: ['4%', '47%', '47%', '1%'] (total=72)
+    Layer 3: ['36%', '4%', '15%', '44%'] (total=72)
+
+--- MoE (N=4, K=2, init=lora) ---
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+  Total parameters: 1,500,710,912
+  Trainable parameters: 2,228,224
+  [MoE-lora] batch=1 in=256 out=32: 0.90s, 3082 MB peak, 35.6 tok/s
+
+  Expert load distribution:
+    Layer 0: ['24%', '36%', '12%', '28%'] (total=72)
+    Layer 1: ['24%', '17%', '26%', '33%'] (total=72)
+    Layer 2: ['35%', '38%', '7%', '21%'] (total=72)
+    Layer 3: ['33%', '36%', '18%', '12%'] (total=72)
+
+======================================================================
+ALL BENCHMARKS COMPLETE
+======================================================================

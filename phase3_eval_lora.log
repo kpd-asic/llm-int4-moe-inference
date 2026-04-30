@@ -1,0 +1,63 @@
+/home1/kpd/.local/lib/python3.12/site-packages/torch/__init__.py:1236: UserWarning: torch.set_default_tensor_type() is deprecated as of PyTorch 2.1, please use torch.set_default_dtype() and torch.set_default_device() as alternatives. (Triggered internally at /pytorch/torch/csrc/tensor/python_tensor.cpp:434.)
+  _C._set_default_tensor_type(t)
+======================================================================
+Quantitative MoE Evaluation
+Eval set: 100 held-out Alpaca samples
+======================================================================
+
+[1/3] Dense Baseline...
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+  Perplexity: 9.66
+  Next-token accuracy: 51.30%
+  Evaluated on 5711 tokens
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+  Generation speed: 76.7 tok/s (4.17s for 10 prompts)
+
+[2/3] MoE Before Training (init=lora, N=4, K=2)...
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+  Perplexity: 9.66
+  Next-token accuracy: 51.30%
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+  Generation speed: 37.0 tok/s (8.64s for 10 prompts)
+
+[3/3] MoE After Training...
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+  Loaded fine-tuned weights from checkpoints/moe_finetuned.pt
+  Training losses: [2.3742679086760425, 2.358795532365082]
+  Perplexity: 9.49
+  Next-token accuracy: 51.69%
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+  Generation speed: 37.0 tok/s (8.65s for 10 prompts)
+  Expert load (first 4 layers):
+    Layer 0: ['25%', '21%', '34%', '21%']
+    Layer 1: ['30%', '11%', '21%', '38%']
+    Layer 2: ['18%', '33%', '20%', '29%']
+    Layer 3: ['31%', '25%', '33%', '11%']
+
+======================================================================
+RESULTS SUMMARY
+======================================================================
+
+Metric                    |        Dense | MoE (before) |  MoE (after)
+----------------------------------------------------------------------
+Perplexity ↓              |         9.66 |         9.66 |         9.49
+Next-token Acc ↑          |       51.30% |       51.30% |       51.69%
+Gen Speed (tok/s) ↑       |         76.7 |         37.0 |         37.0
+
+MoE-before vs Dense:
+  PPL change: 9.66 → 9.66 (↓ better)
+  Acc change: 51.30% → 51.30%
+
+MoE-after vs MoE-before:
+  PPL change: 9.66 → 9.49 (↓ better)
+  Acc change: 51.30% → 51.69%
+
+======================================================================
+DONE
+======================================================================

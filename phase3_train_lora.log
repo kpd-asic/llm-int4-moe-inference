@@ -1,0 +1,141 @@
+/home1/kpd/.local/lib/python3.12/site-packages/torch/__init__.py:1236: UserWarning: torch.set_default_tensor_type() is deprecated as of PyTorch 2.1, please use torch.set_default_dtype() and torch.set_default_device() as alternatives. (Triggered internally at /pytorch/torch/csrc/tensor/python_tensor.cpp:434.)
+  _C._set_default_tensor_type(t)
+======================================================================
+Phase 3: MoE Fine-tuning Experiment
+======================================================================
+Config: N=4, K=2, init_mode=lora, train_samples=200, epochs=2
+
+[1/4] Loading dense baseline model...
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+
+--- Dense Baseline ---
+  Q: Compose a short poem about the beauty of mathematics.
+  A:  The poem must be between 20 and 30 lines long, and must include the words “Beauty of Mathematics” somewhere in the poem
+
+  Q: Write a persuasive paragraph arguing that reading books is better than watching 
+  A:  Use at least two paragraphs of text to support your claim. Use at least one quote from the text to support your claim.
+
+  Q: Draft a professional email declining a job offer politely.
+  A:  The email should include the rejection of the job offer and should be sent within a few days of receiving it.
+Email a p
+
+  Q: If a train travels at 60 mph for 2.5 hours, how far does it go? Show your reason
+  A:  Answer: 150 miles
+If a train travels at 60 mph for 2.5 hours, how far does it go? Show your reasoning. Answer: 150 mile
+
+  Q: What are three key differences between classical and operant conditioning?
+  A:  (2023)
+1. Classical conditioning involves learning by association.
+2. Operant conditioning involves learning by reward 
+
+
+[2/4] Converting to MoE (before fine-tuning)...
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+
+--- MoE (Before Training) ---
+  Q: Compose a short poem about the beauty of mathematics.
+  A:  Include at least 3 mathematical symbols in your poem. You can use mathematical symbols from the math section of the app
+
+  Q: Write a persuasive paragraph arguing that reading books is better than watching 
+  A:  Write a persuasive paragraph arguing that reading books is better than watching TV. The essay should be at least 200 wo
+
+  Q: Draft a professional email declining a job offer politely.
+  A:  This is a good way to let the company know that you are no longer interested in the job offer. It is important to be ho
+
+  Q: If a train travels at 60 mph for 2.5 hours, how far does it go? Show your reason
+  A:  A. 15 miles B. 15.25 miles C. 30 miles D. 45 miles
+If a train travels at 60 mph for 2.5 hours, how far does it go? Show
+
+  Q: What are three key differences between classical and operant conditioning?
+  A:  What are the benefits of classical and operant conditioning? What are the disadvantages of classical and operant condit
+
+Expert load before training (first 4 layers):
+  Layer 0: ['18%', '26%', '21%', '36%']
+  Layer 1: ['41%', '15%', '27%', '17%']
+  Layer 2: ['27%', '33%', '17%', '24%']
+  Layer 3: ['30%', '22%', '17%', '31%']
+
+[3/4] Fine-tuning MoE router + experts...
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+Trainable params: 2,228,224 / 1,500,710,912 (0.15%)
+  Epoch 1, step 50/200, loss=2.2378
+  Epoch 1, step 100/200, loss=2.3629
+  Epoch 1, step 150/200, loss=2.3701
+  Epoch 1, step 200/200, loss=2.3743
+Epoch 1/2: loss=2.3743, time=18.3s
+  Epoch 2, step 50/200, loss=2.2253
+  Epoch 2, step 100/200, loss=2.3472
+  Epoch 2, step 150/200, loss=2.3549
+  Epoch 2, step 200/200, loss=2.3588
+Epoch 2/2: loss=2.3588, time=17.8s
+Training losses: [2.3742679086760425, 2.358795532365082]
+
+[4/4] Evaluating fine-tuned MoE...
+Reloaded tiktoken model from /project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/tokenizer.model
+#words: 128256 - BOS ID: 128000 - EOS ID: 128001
+
+--- MoE (After Training) ---
+  Q: Compose a short poem about the beauty of mathematics.
+  A:  You can use any topic or theme you wish. If you like, you can include a personal story or anecdote about your experienc
+
+  Q: Write a persuasive paragraph arguing that reading books is better than watching 
+  A:  You can use a real book or a book that you made up. You must use at least 3 sources. You must use at least 3 sources.
+
+  Q: Draft a professional email declining a job offer politely.
+  A:  This is a step-by-step guide for writing a professional email declining a job offer. This article will show you how to 
+
+  Q: If a train travels at 60 mph for 2.5 hours, how far does it go? Show your reason
+  A:  A) 150 miles B) 125 miles C) 150 miles D) 150 miles E) 150 miles
+A train travels 60 miles in 2.5 hours. How far does it
+
+  Q: What are three key differences between classical and operant conditioning?
+  A:  How are operant and classical conditioning similar and different?
+What are three key differences between classical and 
+
+Expert load after training (first 4 layers):
+  Layer 0: ['25%', '21%', '34%', '21%']
+  Layer 1: ['30%', '11%', '21%', '38%']
+  Layer 2: ['18%', '33%', '20%', '29%']
+  Layer 3: ['31%', '25%', '33%', '11%']
+
+======================================================================
+COMPARISON: Side-by-side on 5 prompts
+======================================================================
+
+Q: Compose a short poem about the beauty of mathematics.
+  Dense:       The poem must be between 20 and 30 lines long, and must include the words “Beauty of Mathematics” s
+  MoE-before:  Include at least 3 mathematical symbols in your poem. You can use mathematical symbols from the mat
+  MoE-after:   You can use any topic or theme you wish. If you like, you can include a personal story or anecdote 
+
+Q: Write a persuasive paragraph arguing that reading books is better than watching 
+  Dense:       Use at least two paragraphs of text to support your claim. Use at least one quote from the text to 
+  MoE-before:  Write a persuasive paragraph arguing that reading books is better than watching TV. The essay shoul
+  MoE-after:   You can use a real book or a book that you made up. You must use at least 3 sources. You must use a
+
+Q: Draft a professional email declining a job offer politely.
+  Dense:       The email should include the rejection of the job offer and should be sent within a few days of rec
+  MoE-before:  This is a good way to let the company know that you are no longer interested in the job offer. It i
+  MoE-after:   This is a step-by-step guide for writing a professional email declining a job offer. This article w
+
+Q: If a train travels at 60 mph for 2.5 hours, how far does it go? Show your reason
+  Dense:       Answer: 150 miles
+If a train travels at 60 mph for 2.5 hours, how far does it go? Show your reasoni
+  MoE-before:  A. 15 miles B. 15.25 miles C. 30 miles D. 45 miles
+If a train travels at 60 mph for 2.5 hours, how 
+  MoE-after:   A) 150 miles B) 125 miles C) 150 miles D) 150 miles E) 150 miles
+A train travels 60 miles in 2.5 ho
+
+Q: What are three key differences between classical and operant conditioning?
+  Dense:       (2023)
+1. Classical conditioning involves learning by association.
+2. Operant conditioning involves
+  MoE-before:  What are the benefits of classical and operant conditioning? What are the disadvantages of classica
+  MoE-after:   How are operant and classical conditioning similar and different?
+What are three key differences be
+
+======================================================================
+DONE
+======================================================================

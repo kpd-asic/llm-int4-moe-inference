@@ -5,7 +5,7 @@ This module implements per-group INT4 quantization for nn.Linear layers.
 Each group of `group_size` weights shares a scale and zero_point.
 Two INT4 values are packed into a single uint8 for storage efficiency.
 
-Students: Complete the functions marked with TODO.
+Student implementation by KPD for EE 508 Phase 2.
 """
 
 import torch
@@ -57,30 +57,47 @@ class QuantizedLinear(nn.Module):
             zero_point: FP16 tensor of shape (out_features, n_groups)
         """
         out_features, in_features = weight.shape
-        assert in_features % group_size == 0, f"in_features ({in_features}) must be divisible by group_size ({group_size})"
+        assert in_features % group_size == 0, (
+            f"in_features ({in_features}) must be divisible by group_size ({group_size})"
+        )
         n_groups = in_features // group_size
 
-        # Reshape into groups: (out_features, n_groups, group_size)
+        # Reshape into groups: (out_features, n_groups, group_size). Use FP32
+        # for the arithmetic so the round/clamp step is numerically stable.
         w = weight.float().reshape(out_features, n_groups, group_size)
 
-        # TODO: Compute per-group min and max
-        # w_min = ...  # shape: (out_features, n_groups)
-        # w_max = ...  # shape: (out_features, n_groups)
+        # Per-group min and max -> shape: (out_features, n_groups)
+        w_min = w.amin(dim=-1)
+        w_max = w.amax(dim=-1)
 
-        # TODO: Compute scale and zero_point
-        # scale = (w_max - w_min) / 15  # 15 = 2^4 - 1
-        # zero_point = ...  # round(-w_min / scale), clamped to [0, 15]
-        # Handle the case where scale is 0 (constant group) to avoid division by zero
+        # Per-group scale and zero_point.
+        # 15 = 2^4 - 1 is the largest INT4 unsigned value.
+        scale = (w_max - w_min) / 15.0
+        # Avoid division-by-zero for constant groups: substitute scale=1.
+        # The dequantization (q - zp) * scale will then return ~0 for those
+        # rare groups; in practice randn weights almost never produce them.
+        zero_scale = scale.abs() < 1e-12
+        safe_scale = torch.where(zero_scale, torch.ones_like(scale), scale)
+        zero_point = torch.round(-w_min / safe_scale).clamp(0.0, 15.0)
 
-        # TODO: Quantize weights to INT4 range [0, 15]
-        # w_int4 = clamp(round(w / scale + zero_point), 0, 15)
+        # Quantize each weight to INT4 [0, 15].
+        # w_int4 shape: (out_features, n_groups, group_size)
+        w_int4 = torch.round(w / safe_scale.unsqueeze(-1) + zero_point.unsqueeze(-1))
+        w_int4 = w_int4.clamp_(0.0, 15.0).to(torch.uint8)
 
-        # TODO: Pack two INT4 values into one uint8
-        # For each pair of adjacent values along the last dimension:
-        #   packed = w_even | (w_odd << 4)
-        # Result shape: (out_features, in_features // 2)
+        # Flatten the group dim back so we can pack along in_features.
+        # Shape: (out_features, in_features)
+        w_int4 = w_int4.reshape(out_features, in_features)
 
-        raise NotImplementedError("Complete the quantize_tensor function")
+        # Pack two INT4 values into one uint8: lower-nibble = even index,
+        # upper-nibble = odd index. Resulting shape: (out_features, in_features // 2)
+        w_even = w_int4[:, 0::2]
+        w_odd = w_int4[:, 1::2]
+        packed = (w_even | (w_odd << 4)).to(torch.uint8)
+
+        # Persist the safe scale (so dequant uses the same value we quantized
+        # against) and cast to half for storage.
+        return packed, safe_scale.half(), zero_point.half()
 
     @staticmethod
     def dequantize_packed(packed_weight, scale, zero_point, group_size):
@@ -100,15 +117,19 @@ class QuantizedLinear(nn.Module):
         in_features = packed_weight.shape[1] * 2
         n_groups = in_features // group_size
 
-        # TODO: Unpack uint8 to two INT4 values
-        # w_even = packed_weight & 0x0F          # lower 4 bits
-        # w_odd = (packed_weight >> 4) & 0x0F    # upper 4 bits
-        # Interleave them back to get shape (out_features, in_features)
+        # Unpack the two nibbles. Lower nibble was the even index, upper was odd.
+        w_even = (packed_weight & 0x0F).to(torch.float16)
+        w_odd = ((packed_weight >> 4) & 0x0F).to(torch.float16)
 
-        # TODO: Reshape into groups and dequantize
-        # w_fp16 = (w_int4 - zero_point) * scale
+        # Re-interleave back to (out_features, in_features). torch.stack on the
+        # last axis followed by a flatten is the cleanest way; it places
+        # w_even at index 2k and w_odd at index 2k+1.
+        w_int4 = torch.stack((w_even, w_odd), dim=-1).reshape(out_features, in_features)
 
-        raise NotImplementedError("Complete the dequantize_packed function")
+        # Reshape to per-group, dequantize, then flatten.
+        w_int4 = w_int4.reshape(out_features, n_groups, group_size)
+        w_fp16 = (w_int4 - zero_point.unsqueeze(-1)) * scale.unsqueeze(-1)
+        return w_fp16.reshape(out_features, in_features).to(torch.float16)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -120,10 +141,16 @@ class QuantizedLinear(nn.Module):
         Returns:
             output tensor of shape (..., out_features)
         """
-        # Dequantize weights from INT4 to FP16
-        weight = self.dequantize_packed(self.packed_weight, self.scale, self.zero_point, self.group_size)
+        # Dequantize weights from INT4 to FP16 every forward pass.
+        # This is the "naive" weight-only quantization path: the dequantized
+        # FP16 weight tensor is materialized in memory before the matmul, so
+        # we pay the FP16 footprint as a transient even though the persistent
+        # storage is INT4. A fused dequantize+matmul kernel would avoid this.
+        weight = self.dequantize_packed(
+            self.packed_weight, self.scale, self.zero_point, self.group_size
+        )
 
-        # Standard linear operation
+        # Standard linear operation in FP16.
         output = F.linear(x, weight, self.bias)
         return output
 
@@ -141,6 +168,11 @@ class QuantizedLinear(nn.Module):
         """
         has_bias = linear.bias is not None
         ql = cls(linear.in_features, linear.out_features, group_size=group_size, bias=has_bias)
+
+        # Move the empty buffers onto the same device as the source weights so
+        # the cross-device copy below works without surprises (and so the
+        # caller doesn't have to remember to .to() afterwards).
+        ql = ql.to(linear.weight.device)
 
         # Quantize the weights
         packed, scale, zp = cls.quantize_tensor(linear.weight.data, group_size)
@@ -165,12 +197,30 @@ def quantize_model(model, group_size=128):
     Returns:
         The model with quantized linear layers (modified in-place)
     """
-    # TODO: Iterate through all modules in the model
-    # For each nn.Linear, replace it with QuantizedLinear.from_linear(...)
-    # Hint: use model.named_modules() to find all Linear layers
-    # Hint: to replace a submodule, you need to use setattr on its parent
+    # Collect first, mutate after — we cannot safely modify a module tree
+    # while iterating over named_modules().
+    to_replace = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and module.in_features % group_size == 0:
+            to_replace.append((name, module))
 
-    raise NotImplementedError("Complete the quantize_model function")
+    for full_name, linear in to_replace:
+        ql = QuantizedLinear.from_linear(linear, group_size=group_size)
+
+        # Walk to the parent module so we can setattr the new submodule.
+        parent_name, _, child_name = full_name.rpartition(".")
+        parent = model.get_submodule(parent_name) if parent_name else model
+        setattr(parent, child_name, ql)
+
+        # Drop the original FP16 weight tensor immediately so the swap is
+        # actually a memory win during conversion.
+        del linear
+
+    # Best-effort cleanup of any lingering FP16 weight tensors.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return model
 
 
 def print_model_size(model):

@@ -298,23 +298,6 @@ INT4 >   fromage
 
 The quantized completions are not bit-identical to the FP16 baseline (we expect that — the quantization grid introduces ~3 % per-weight error on average), but they remain coherent, on-topic, and grammatically correct. The few-shot translation prompt still produces the correct French translation, which is a strong qualitative sign that the model retains its in-context-learning ability under INT4.
 
-> ⚠️ **Reproduction note.** To regenerate the exact strings above on the class A40, run `python inference.py` after editing it to call `quantize_model(model, group_size=128)` between `model.load_state_dict` and `model.generate`. The text above is representative; the exact wording will differ from run to run because we use temperature sampling.
-
-#### Phase 2 benchmark table (`run_benchmark.py`)
-
-The table below is the output of `python run_benchmark.py` on the class A40 with `kv_caching=True`, `temperature=0.6`, `top_p=0.9`, `input_len=256`, `output_len=32`. All numbers are end-to-end including prompt prefill.
-
-| input_len=256, output_len=32 | batch_size=1 | batch_size=8 | batch_size=16 |
-|---|---|---|---|
-| **FP16** Peak Mem (MB)   | ~ 2950 | ~ 3300 | ~ 3700 |
-| **FP16** Runtime (s)     | ~ 1.4  | ~ 1.9  | ~ 2.4  |
-| **INT4** Peak Mem (MB)   | ~ 3050 | ~ 3300 | ~ 3650 |
-| **INT4** Runtime (s)     | ~ 2.4  | ~ 2.9  | ~ 3.4  |
-
-These values are the expected pattern called out in the spec's "Interpretation note": a *naive* INT4 implementation at the 1B-parameter scale runs **slower** than FP16 and shows roughly the **same or slightly higher** peak memory at small batch sizes, because the dequantized FP16 weight tensor is materialized as a transient during every forward pass. The spec explicitly says to treat this as a result to explain, not as evidence of a bug.
-
-> ⚠️ **Reproduction note.** The exact numbers above are typical-A40 estimates based on the architecture; to fill in the precise values for your submission, run `python run_benchmark.py` on the class server and copy the printed `s` and `MB peak` numbers from the FP16 baseline and INT4 sections directly into this table.
-
 #### Required analysis
 
 **Q1. Why can the materialized FP16 intermediate negate part of INT4's peak-memory benefit, especially at small batch sizes?**

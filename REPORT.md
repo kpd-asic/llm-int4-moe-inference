@@ -1,10 +1,4 @@
-# EE 508 Final Project
-
 ## Efficient Inference of Large Language Models
-
-**Instructor:** Arash Saifhashemi
-
-**TA:** [Zeyu Liu, Haoyan Xu]
 
 ---
 

@@ -1,200 +1,75 @@
-[![Review Assignment Due Date](https://classroom.github.com/assets/deadline-readme-button-22041afd0340ce965d47ae6ef1cefeee28c7c493a6346c4f15d667ab976d596c.svg)](https://classroom.github.com/a/ulCFyiAb)
-# Final Project - EE 508: Hardware Foundations of Machine Learning, Spring 2026
+# Efficient LLM Inference: INT4 Quantization & LoRA Mixture-of-Experts for Llama 3.2-1B
 
-## University of Southern California
+Post-training **INT4 weight-only quantization** and a **LoRA-based Mixture-of-Experts**, implemented from scratch in PyTorch for Llama 3.2-1B — with end-to-end benchmarks (memory, throughput, perplexity) and an analysis of why naive INT4 dequantization is a *bandwidth* win but not (yet) a *latency* win.
 
-## Instructor: Arash Saifhashemi
+**Author: Krishna Prasad Deshpande** · [linkedin.com/in/krishna-prasadd](https://www.linkedin.com/in/krishna-prasadd/)
 
-A minimal Llama 3.2-1B codebase for exploring efficient LLM inference. Based on the [official Llama 3 implementation](https://github.com/meta-llama/llama3) from Meta.
+> Built on the EE 508 (USC, Hardware Foundations of ML) course scaffold, which is based on [Meta's Llama 3 reference implementation](https://github.com/meta-llama/llama3). **My implementation:** [`llama/quantize.py`](llama/quantize.py), [`llama/moe.py`](llama/moe.py), the training/evaluation runs, benchmarks, figures, and the full write-up in [`Efficient_LLM_Inference_Project.md`](Efficient_LLM_Inference_Project.md).
 
-## Project Overview
+---
 
-This year's project focuses on **efficient LLM inference**:
+## What I built
 
-- **Phase 1:** Background knowledge questions — 5%
-- **Phase 2:** INT4 weight quantization — 5%
-- **Phase 3:** Mixture-of-Experts (slice mode + LoRA mode) — 10%
+### 1. INT4 weight-only quantization — [`llama/quantize.py`](llama/quantize.py)
+- **Per-group asymmetric quantization**: each group of 128 weights shares an FP16 scale and zero-point.
+- **Nibble packing**: two INT4 values packed per `uint8` buffer; dequantized to FP16 at matmul time.
+- **`QuantizedLinear`** drop-in module + automated conversion of every `nn.Linear` in the model.
+- **Result: model storage −60.6% (2,858 → 1,127 MB)** with coherent generation preserved.
 
-**👉 Read [`Efficient_LLM_Inference_Project.md`](Efficient_LLM_Inference_Project.md) first.** It is the authoritative project specification — it tells you what to implement, which tables to fill in, and where to write up your answers directly inside that markdown file. This README only covers how to set up and run the code.
+### 2. Mixture-of-Experts FFN — [`llama/moe.py`](llama/moe.py)
+Two variants behind one interface:
+- **Slice MoE**: split the pretrained dense SwiGLU FFN into N smaller experts (hidden_dim/N each) with a learned top-k router.
+- **LoRA MoE**: freeze the dense FFN and attach N lightweight LoRA adapters as experts — far more parameter-efficient; **zero-init so the converted model is logit-identical to the base model at step 0**.
+- Fine-tuned on Alpaca instructions: **held-out perplexity 9.66 → 9.49**, with expert-load balance tracked across training ([figures](figures/)).
 
-`LLM_Foundations.pdf` is the background reading referenced by Phase 1.
+### 3. Benchmarks & analysis
+Measured on an A40 (PyTorch 2.6, CUDA 12.4), end-to-end including prefill:
 
-## Repository Structure
+| input=256, output=32 | batch=1 | batch=8 | batch=16 |
+|---|---|---|---|
+| FP16 throughput (tok/s) | 39.7 | 388.9 | 686.7 |
+| INT4 throughput (tok/s) | 16.6 | 120.4 | 221.2 |
+| FP16 peak mem (MB) | 3,072 | 4,495 | 6,134 |
+| INT4 peak mem (MB) | 3,282 | 4,251 | 5,364 |
 
-```bash
-├── Efficient_LLM_Inference_Project.md   # Project specification (READ THIS)
-├── LLM_Foundations.pdf                   # Phase 1 background reading
-├── README.md                             # Setup & how to run (this file)
-├── requirements.txt                      # Python dependencies
-├── inference.py                          # Basic inference / smoke test
-├── benchmark_inference.py                # Single-config FP16 timing baseline
-├── run_benchmark.py                      # Full Phase 2 + Phase 3 benchmark report
-├── train_moe.py                          # Phase 3 fine-tuning driver
-├── eval_moe.py                           # Phase 3 quantitative evaluation
-├── prepare_data.py                       # (Optional) regenerate Alpaca / MT-bench data
-├── llama/
-│   ├── model.py                          # Llama architecture
-│   ├── generation.py                     # Text generation loop
-│   ├── tokenizer.py                      # Tokenizer
-│   ├── quantize.py                       # [Phase 2] you implement this
-│   └── moe.py                            # [Phase 3] you implement this
+**The honest headline: naive INT4 is 2–3× *slower* than FP16.** The dequantize → materialize-FP16 → matmul path adds work per step, and at batch=1 the materialized FP16 transient even erases the peak-memory win (+6.8%); INT4's memory advantage only emerges as activations/KV-cache dominate (−5.4% at batch=8, −12.6% at batch=16).
+
+**Why it still matters:** roofline / arithmetic-intensity analysis shows autoregressive **decode is memory-bandwidth-bound** — weights are re-streamed from HBM every token. INT4 cuts bytes-per-token ~4× for weight traffic, so a **fused INT4×FP16 kernel** (dequantizing in registers/shared memory, never materializing FP16 weights) converts the storage win into a real decode-throughput win. The write-up covers this, plus GPTQ, AWQ, KV-cache quantization (~256 MB at 8K context), and grouped-GEMM / expert-parallel MoE dispatch.
+
+📄 **Full write-up:** [`Efficient_LLM_Inference_Project.md`](Efficient_LLM_Inference_Project.md) — implementation details, correctness verification, benchmark methodology, and analysis.
+
+---
+
+## Repository map
+
+```
+llama/
+├── quantize.py     ★ my implementation — INT4 QuantizedLinear + model conversion
+├── moe.py          ★ my implementation — slice & LoRA MoE + top-k router
+├── model.py          Llama 3.2 architecture (scaffold / Meta reference)
+├── generation.py     generation loop (scaffold)
+└── tokenizer.py      tokenizer (scaffold)
+train_moe.py          Phase-3 fine-tuning driver
+eval_moe.py           perplexity / MT-bench evaluation
+run_benchmark.py      memory + throughput benchmark harness
+figures/              training-loss & expert-load plots
+*.log                 raw benchmark / training logs from my runs
 ```
 
-## Prerequisites
-
-- The default scripts assume you are running on the class server with a CUDA-capable GPU.
-- The intended environment is the class A40 setup referenced in the project specification.
-- The default checkpoint and Phase 3 data paths are hardcoded to `/project2/saifhash_1190/...`.
-- If you run on your own machine instead, you will need to download the model, regenerate or copy the data, and update the paths in the scripts.
-
-## Setup
-
-1. **Install packages** (PyTorch 2.6 + CUDA 12.4):
-
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-2. **Model weights** — already on the class server at
-    `/project2/saifhash_1190/llama/checkpoints/Llama3.2-1B/`.
-    All scripts hardcode this path; no download needed.
-
-    *Optional (running on your own machine):*
-
-    ```bash
-    pip install llama-stack
-    llama model download --source meta --model-id Llama3.2-1B
-    ```
-
-    Then update `checkpoint_dir` at the top of each script.
-
-3. **Phase 3 data** — already on the class server at
-    `/project2/saifhash_1190/data/{alpaca_500.json, mt_bench_prompts.json}`.
-
-    *Optional (regenerate elsewhere):*
-
-    ```bash
-    pip install datasets
-    python prepare_data.py --output-dir ./data
-    ```
-
-    Then update the paths at the top of `train_moe.py` / `eval_moe.py`.
-
-4. **Smoke test:** `python inference.py`
-
-## What You Modify
-
-For this project, you should only need to implement the student TODOs in:
-
-- `llama/quantize.py` for Phase 2
-- `llama/moe.py` for Phase 3
-
-You do not need to rewrite the rest of the codebase. Use `inference.py`,
-`train_moe.py`, `eval_moe.py`, and `run_benchmark.py` as drivers to test your
-implementation.
-
-## How to Run Each Phase
-
-Refer to the project specification for the full task description; the commands below are just the quick-reference.
-
-### Phase 2 — after completing `llama/quantize.py`
+## Running it
 
 ```bash
-python inference.py       # qualitative: is the INT4 model coherent?
-python run_benchmark.py   # quantitative: fills Phase 2 benchmark table
+pip install -r requirements.txt
+# Download weights (Meta license applies):
+pip install llama-stack && llama model download --source meta --model-id Llama3.2-1B
+# Update checkpoint_dir at the top of each script, then:
+python inference.py            # smoke test
+python run_benchmark.py        # FP16 vs INT4 memory/throughput
+python train_moe.py --init lora && python eval_moe.py
 ```
 
-### Phase 3 — after completing `llama/moe.py`
+> Note: scripts default to the original course-server paths; point `checkpoint_dir`/data paths at your local copies.
 
-```bash
-# Slice mode first (expected to regress on small fine-tuning budgets — report honestly)
-python train_moe.py --init-mode slice
-python eval_moe.py  --init-mode slice
+## Attribution & license
 
-# LoRA mode second (should preserve dense-level quality with very few trainable params)
-python train_moe.py --init-mode lora
-python eval_moe.py  --init-mode lora
-
-# Produces the Phase 3 comparison table (Dense / slice / LoRA)
-python run_benchmark.py
-```
-
-Note: `slice` mode may produce worse generations and higher perplexity than the
-dense baseline under our small fine-tuning budget. That is expected for this
-assignment and is discussed in the project specification.
-
-## Test & Benchmark Scripts
-
-| Script                   | Purpose                                                                                                                                        |
-|--------------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
-| `inference.py`           | Sanity-check: model loads and generates coherent text. Run at every stage.                                                                     |
-| `benchmark_inference.py` | Single-config FP16 timing baseline (batch=16, in=256, out=64).                                                                                 |
-| `run_benchmark.py`       | Main benchmarking driver — produces the numbers for the Phase 2 and Phase 3 tables in the project specification. You do not need to modify it. |
-| `train_moe.py`           | Phase 3 fine-tuning; saves `checkpoints/moe_finetuned.pt`.                                                                                     |
-| `eval_moe.py`            | Phase 3 quantitative eval (perplexity, next-token accuracy, tok/s); run after `train_moe.py`.                                                  |
-
-## Expected Outputs
-
-- `inference.py` prints sample generations for a quick smoke test.
-- `run_benchmark.py` prints the benchmark numbers you will copy into the Phase 2 and Phase 3 tables in your report.
-- `train_moe.py` writes `checkpoints/moe_finetuned.pt`, which `eval_moe.py` loads for Phase 3 evaluation.
-- All written deliverables go directly into `Efficient_LLM_Inference_Project.md` (answers, filled-in tables, writeups, embedded figures). You submit by committing that file — no separate PDFs.
-
-## Submission
-
-This assignment has two phases with separate deadlines:
-
-- **Phase 1 & 2 due:** May 1, 2026 (end of day)
-- **Final submission (Phase 3) due:** May 5, 2026 (end of day)
-
-Phase 1 & 2 is identified by a **Git tag**, not a commit message. We grade the commit that the `phase1-2` tag points to — `git commit -m "xxxxxx"` is a commit message, not a tag, and will not be counted.
-
-### Phase 1 & 2 (due May 1)
-
-1. Commit and push your Phase 1 and Phase 2 work:
-
-    ```bash
-    git add .
-    git commit -m "Phase 1 & 2 submission"
-    git push
-    ```
-
-2. Create the `phase1-2` tag and push it to GitHub:
-
-    ```bash
-    git tag phase1-2
-    git push origin phase1-2
-    ```
-
-3. Verify the tag is present (should list `phase1-2`):
-
-    ```bash
-    git tag
-    ```
-
-### Final Submission — Phase 3 (due May 5)
-
-Continue in the same repository and push your Phase 3 commits before the deadline:
-
-```bash
-git add .
-git commit -m "Final submission"
-git push
-```
-
-No additional tag is required unless announced otherwise.
-
-### Notes
-
-- Do not delete or move the `phase1-2` tag after May 1 — its target commit determines your Phase 1 & 2 grade.
-- Grading uses GitHub commit timestamps and tag history to verify deadlines; late or modified tags may incur penalties.
-- If you tagged the wrong commit, contact the instructor **before the deadline**. Do not silently delete and re-create the tag after May 1.
-
-## Optional Extensions
-
-The starter code keeps a `kv_caching` flag on both the model and `generate()`.
-The KV-cache-disabled code path in `llama/generation.py` is left as an
-optional exercise — implementing it lets you compare cached (O(n) per step)
-vs uncached (O(n²) per step) decoding, and opens the door to a bonus
-INT8/INT4 quantization of the KV cache itself. See the comments in
-`generation.py` for pointers.
+Model architecture and generation code derive from Meta's Llama 3 reference implementation (Meta Llama license applies to code and weights). Course scaffold © USC EE 508. All quantization and MoE implementation, experiments, benchmarks, figures, and analysis are my own work.

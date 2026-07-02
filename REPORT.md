@@ -625,5 +625,3 @@ A better implementation in this codebase would be to (1) compute expert assignme
 **Total GPU time per group: ~1–2 hours (reference only, P100 may need longer time).**
 
 **Hardware:** A40 (48 GB). Llama 3.2-1B in FP16 is ~2.5 GB; INT4 quantized is ~625 MB. MoE fits comfortably.
-
-**Please check deadlines and deliverables in the course schedule.**

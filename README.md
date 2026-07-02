@@ -4,7 +4,7 @@ Post-training **INT4 weight-only quantization** and a **LoRA-based Mixture-of-Ex
 
 **Author: Krishna Prasad Deshpande** · [linkedin.com/in/krishna-prasadd](https://www.linkedin.com/in/krishna-prasadd/)
 
-> Built on the EE 508 (USC, Hardware Foundations of ML) course scaffold, which is based on [Meta's Llama 3 reference implementation](https://github.com/meta-llama/llama3). **My implementation:** [`llama/quantize.py`](llama/quantize.py), [`llama/moe.py`](llama/moe.py), the training/evaluation runs, benchmarks, figures, and the full write-up in [`Efficient_LLM_Inference_Project.md`](Efficient_LLM_Inference_Project.md).
+> Built on the EE 508 (USC, Hardware Foundations of ML) course scaffold, which is based on [Meta's Llama 3 reference implementation](https://github.com/meta-llama/llama3). **My implementation:** [`llama/quantize.py`](llama/quantize.py), [`llama/moe.py`](llama/moe.py), the training/evaluation runs, benchmarks, figures, and the full write-up in [`REPORT.md`](REPORT.md).
 
 ---
 
@@ -36,7 +36,7 @@ Measured on an A40 (PyTorch 2.6, CUDA 12.4), end-to-end including prefill:
 
 **Why it still matters:** roofline / arithmetic-intensity analysis shows autoregressive **decode is memory-bandwidth-bound** — weights are re-streamed from HBM every token. INT4 cuts bytes-per-token ~4× for weight traffic, so a **fused INT4×FP16 kernel** (dequantizing in registers/shared memory, never materializing FP16 weights) converts the storage win into a real decode-throughput win. The write-up covers this, plus GPTQ, AWQ, KV-cache quantization (~256 MB at 8K context), and grouped-GEMM / expert-parallel MoE dispatch.
 
-📄 **Full write-up:** [`Efficient_LLM_Inference_Project.md`](Efficient_LLM_Inference_Project.md) — implementation details, correctness verification, benchmark methodology, and analysis.
+📄 **Full write-up:** [`REPORT.md`](REPORT.md) — implementation details, correctness verification, benchmark methodology, and analysis.
 
 ---
 
